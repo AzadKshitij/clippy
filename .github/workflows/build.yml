@@ -1,0 +1,61 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag del release (ej. v0.3.0)"
+        required: false
+      publish:
+        description: "Publicar el release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    # Escribir solo para crear el release (en PRs de forks GitHub igual da solo lectura).
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compilar
+        run: cargo build --release --locked
+
+      - name: Compilar con devtools (solo para verificar)
+        run: cargo build --release --locked --features devtools --target-dir target/dev
+
+      - name: Preparar Clippy.exe
+        shell: bash
+        run: |
+          cp target/release/clippy.exe Clippy.exe
+          echo "Tamaño: $(stat -c %s Clippy.exe) bytes"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Clippy.exe
+          path: Clippy.exe
+
+      - name: Publicar el release
+        if: github.event_name == 'workflow_dispatch' && inputs.publish && inputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" Clippy.exe --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" Clippy.exe --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Clippy ${TAG#v}" --notes ""
+          fi
