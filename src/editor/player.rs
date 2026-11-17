@@ -174,32 +174,36 @@ pub(super) struct Video {
     w: u32,
     h: u32,
     stride: i32,
+    /// Hasta dónde se leyó: el fin del último cuadro que salió del decodificador.
+    read: Option<i64>,
 }
 
 impl Video {
-    #[cfg(feature = "devtools")]
-    /// Decodificador por CPU: para cuadros sueltos (miniaturas) arranca y busca más rápido que la GPU.
+    /// Decodificador por CPU, para un cuadro suelto (la portada): abre en unos 60 ms contra 300 por GPU.
     pub(super) fn open_cpu(path: &std::path::Path, w: u32, h: u32) -> Result<Video> {
-        unsafe { Self::configure(path, w, h, None) }
+        unsafe { Self::configure(path, w, h, None, true) }
     }
 
-    pub(super) fn open(path: &std::path::Path, w: u32, h: u32) -> Result<Video> {
+    /// Con `still` es para cuadros sueltos (portada, miniaturas): el decodificador entrega cada cuadro
+    /// apenas lo tiene en vez de juntar varios, y cada búsqueda sale unos 20 ms más rápido.
+    pub(super) fn open(path: &std::path::Path, w: u32, h: u32, still: bool) -> Result<Video> {
         unsafe {
             // Primero por GPU; si algo falla, decodificación por CPU.
             if let Ok(mgr) = d3d_manager() {
-                if let Ok(mut v) = Self::configure(path, w, h, Some(&mgr)) {
+                if let Ok(mut v) = Self::configure(path, w, h, Some(&mgr), still) {
                     if v.next().is_ok() {
                         seek(&v.r, 0)?;
+                        v.read = None;
                         return Ok(v);
                     }
                 }
             }
-            Self::configure(path, w, h, None)
+            Self::configure(path, w, h, None, still)
         }
     }
 
-    unsafe fn configure(path: &std::path::Path, w: u32, h: u32, mgr: Option<&IMFDXGIDeviceManager>) -> Result<Video> {
-        let r = reader(path, true, mgr)?;
+    unsafe fn configure(path: &std::path::Path, w: u32, h: u32, mgr: Option<&IMFDXGIDeviceManager>, still: bool) -> Result<Video> {
+        let r = reader(path, true, mgr, still)?;
         r.SetStreamSelection(media::ANY, false)?;
         r.SetStreamSelection(VIDEO, true)?;
         let t = MFCreateMediaType()?;
@@ -211,7 +215,7 @@ impl Video {
         })?;
         let cur = r.GetCurrentMediaType(VIDEO)?;
         let stride = cur.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or((w * 4) as i32);
-        Ok(Video { r, w, h, stride })
+        Ok(Video { r, w, h, stride, read: None })
     }
 
     /// Siguiente cuadro decodificado: (pts, duración, muestra). None al final.
@@ -222,6 +226,7 @@ impl Video {
                 self.r.ReadSample(VIDEO, 0, None, Some(&mut flags), Some(&mut ts), Some(&mut s))?;
                 if let Some(s) = s {
                     let d = s.GetSampleDuration().unwrap_or(166_666);
+                    self.read = Some(ts + d);
                     return Ok(Some((ts, d, s)));
                 }
                 if flags & EOS != 0 {
@@ -265,6 +270,28 @@ impl Video {
     /// Busca y devuelve el cuadro visible en `t`.
     pub(super) fn frame_at(&mut self, t: i64) -> Result<Option<egui::ColorImage>> {
         unsafe { seek(&self.r, t)? };
+        self.read = None;
+        self.decode_to(t)
+    }
+
+    /// Como `frame_at`, pero si lo último que se leyó ya pasó `key` (el fotograma clave anterior a `t`)
+    /// sigue desde ahí sin buscar: recorrer el clip hacia adelante decodifica cada cuadro una sola vez.
+    pub(super) fn frame_ahead(&mut self, t: i64, key: i64) -> Result<Option<egui::ColorImage>> {
+        if self.read.is_some_and(|r| r >= key && r <= t) {
+            self.decode_to(t)
+        } else {
+            self.frame_at(t)
+        }
+    }
+
+    /// El fotograma clave anterior a `t` (o en `t`): sale de un solo cuadro, sin decodificar hasta `t`.
+    pub(super) fn key_frame_before(&mut self, t: i64) -> Result<Option<egui::ColorImage>> {
+        unsafe { seek(&self.r, t)? };
+        self.read = None;
+        self.next()?.map(|(_, _, s)| self.to_image(&s)).transpose()
+    }
+
+    fn decode_to(&mut self, t: i64) -> Result<Option<egui::ColorImage>> {
         let mut last = None;
         while let Some((ts, d, s)) = self.next()? {
             let hit = ts + d > t;
@@ -285,7 +312,7 @@ fn publish(shared: &Shared, ctx: &egui::Context, img: egui::ColorImage) {
 
 fn video_thread(path: PathBuf, w: u32, h: u32, clock: Arc<Clock>, rx: Receiver<VCmd>, shared: Arc<Shared>, ctx: egui::Context) {
     let _mf = Mf::init();
-    let mut v = match Video::open(&path, w, h) {
+    let mut v = match Video::open(&path, w, h, false) {
         Ok(v) => v,
         Err(e) => {
             *shared.error.lock().unwrap() = Some(e.to_string());
@@ -418,7 +445,7 @@ fn audio_thread(path: PathBuf, rx: Receiver<ACmd>, gain: Arc<AtomicU32>, speed: 
 }
 
 unsafe fn audio_setup(path: &std::path::Path) -> Result<(IMFSourceReader, IAudioClient, IAudioRenderClient, u32)> {
-    let r = reader(path, false, None)?;
+    let r = reader(path, false, None, false)?;
     r.SetStreamSelection(media::ANY, false)?;
     r.SetStreamSelection(AUDIO, true)?;
     r.SetCurrentMediaType(AUDIO, None, &mf::pcm_type()?)?;
