@@ -319,27 +319,46 @@ fn trim_video(p: &mut VecDeque<Packet>, min_pts: i64) {
 }
 
 /// Mezcla juego, micrófono y escritorio con sus volúmenes (el aviso de guardado se silencia en escritorio).
+/// Corre en el hilo de grabación al apretar la tecla: va por tramos cortos para no frenar la captura
+/// ni pedir otra copia del audio entero.
 fn mixed_audio(cfg: &Config, au: &AudioState, from: i64, to: i64) -> Vec<i16> {
+    const CHUNK: usize = 4096; // frames por tramo
     let n = (to - from).max(0) as usize;
-    let mut mix = vec![0f32; n * 2];
-    if cfg.game_audio {
-        au.game_ch.buf.mix_into(&mut mix, from, cfg.game_volume as f32 / 100.0);
+    // Partes del canal escritorio donde no sonó el aviso de guardado (los avisos ya están en orden).
+    let frame = |t: i64| ((frames_at(t) - from).max(0) as usize).min(n);
+    let mut desktop = Vec::new();
+    let mut at = 0;
+    for (a, b) in au.masks.iter().map(|&(a, b)| (frame(a), frame(b))).chain([(n, n)]) {
+        if a > at {
+            desktop.push((at, a));
+        }
+        at = at.max(b);
     }
-    if cfg.mic_audio {
-        au.mic.buf.mix_into(&mut mix, from, cfg.mic_volume as f32 / 100.0);
-    }
-    if cfg.desktop_audio {
-        let mut d = vec![0f32; n * 2];
-        au.desktop.buf.mix_into(&mut d, from, cfg.desktop_volume as f32 / 100.0);
-        for &(a, b) in &au.masks {
-            let (fa, fb) = ((frames_at(a) - from).max(0) as usize, ((frames_at(b) - from).max(0) as usize).min(n));
-            if fa < fb {
-                d[fa * 2..fb * 2].iter_mut().for_each(|x| *x = 0.0);
+
+    let mut out = Vec::with_capacity(n * 2);
+    let mut buf = [0f32; CHUNK * 2];
+    for c0 in (0..n).step_by(CHUNK) {
+        let c1 = (c0 + CHUNK).min(n);
+        let mix = &mut buf[..(c1 - c0) * 2];
+        mix.fill(0.0);
+        let f = from + c0 as i64;
+        if cfg.game_audio {
+            au.game_ch.buf.mix_into(mix, f, cfg.game_volume as f32 / 100.0);
+        }
+        if cfg.mic_audio {
+            au.mic.buf.mix_into(mix, f, cfg.mic_volume as f32 / 100.0);
+        }
+        if cfg.desktop_audio {
+            for &(a, b) in &desktop {
+                let (a, b) = (a.max(c0), b.min(c1));
+                if a < b {
+                    au.desktop.buf.mix_into(&mut mix[(a - c0) * 2..(b - c0) * 2], from + a as i64, cfg.desktop_volume as f32 / 100.0);
+                }
             }
         }
-        mix.iter_mut().zip(d).for_each(|(m, x)| *m += x);
+        out.extend(mix.iter().map(|x| x.clamp(i16::MIN as f32, i16::MAX as f32) as i16));
     }
-    mix.into_iter().map(|x| x.clamp(i16::MIN as f32, i16::MAX as f32) as i16).collect()
+    out
 }
 
 /// Arma el trabajo de guardado y lo lanza en otro hilo. Devuelve false si no había nada que guardar.
