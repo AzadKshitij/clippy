@@ -334,8 +334,10 @@ fn http_get(url: &str) -> Result<Vec<u8>> {
             &mut len,
             &mut idx,
         )?;
-        if status != 200 {
-            bail!("el servidor respondió {status}");
+        match status {
+            200 => {}
+            403 | 429 => bail!("GitHub está limitando las consultas desde tu conexión. Probá de nuevo en un rato"),
+            _ => bail!("el servidor respondió {status}"),
         }
         let mut body = Vec::new();
         loop {
