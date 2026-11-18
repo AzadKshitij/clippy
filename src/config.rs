@@ -40,11 +40,21 @@ impl From<CaptureMode> for &'static str {
 }
 
 pub const MAX_SECONDS: u32 = 300;
+/// Extra shortcuts (one clip duration each) that can be configured.
+pub const MAX_CLIP_KEYS: usize = 4;
 /// Calidad de video (Mbps) que se puede elegir a mano en "Personalizada".
 pub const MIN_MBPS: u32 = 5;
 pub const MAX_MBPS: u32 = 150;
 /// Resoluciones del clip que se pueden elegir (lado corto en px; 0 = como el monitor).
 pub const RESOLUTIONS: [u32; 4] = [0, 1440, 1080, 720];
+
+/// Extra shortcut: a key that saves its own duration (vk 0 = no key set).
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
+pub struct ClipKey {
+    pub seconds: u32,
+    pub vk: u32,
+    pub mods: u32,
+}
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 #[serde(default)]
@@ -80,6 +90,9 @@ pub struct Config {
     /// Atajo global para abrir la carpeta de clips (vk 0 = sin asignar).
     pub folder_vk: u32,
     pub folder_mods: u32,
+    /// Extra shortcuts, each saving its own duration. The buffer holds the longest of them.
+    #[serde(default)]
+    pub clip_keys: Vec<ClipKey>,
 }
 
 /// Atajos globales: funcionan en cualquier momento, incluso dentro del juego.
@@ -114,6 +127,32 @@ impl GlobalAction {
     }
 }
 
+/// A global hotkey: one of the fixed actions or an extra clip duration.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HotkeySlot {
+    Global(GlobalAction),
+    Clip(usize),
+}
+
+/// First id for the extra shortcuts (RegisterHotKey ids below 0xBFFF).
+const CLIP_HOTKEY_ID: i32 = 100;
+
+/// RegisterHotKey / WM_HOTKEY id of a slot.
+pub fn slot_id(slot: HotkeySlot) -> i32 {
+    match slot {
+        HotkeySlot::Global(a) => a.id(),
+        HotkeySlot::Clip(i) => CLIP_HOTKEY_ID + i as i32,
+    }
+}
+
+/// Slot for a WM_HOTKEY id, if the id belongs to one.
+pub fn slot_from_id(id: i32) -> Option<HotkeySlot> {
+    GlobalAction::from_id(id).map(HotkeySlot::Global).or_else(|| {
+        let i = id - CLIP_HOTKEY_ID;
+        (0..MAX_CLIP_KEYS as i32).contains(&i).then_some(HotkeySlot::Clip(i as usize))
+    })
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -140,6 +179,7 @@ impl Default for Config {
             editor_mods: 0,
             folder_vk: 0,
             folder_mods: 0,
+            clip_keys: Vec::new(),
         }
     }
 }
@@ -194,16 +234,62 @@ impl Config {
                 *vk = 0;
             }
         }
+        self.clip_keys.truncate(MAX_CLIP_KEYS);
+        for k in &mut self.clip_keys {
+            k.seconds = k.seconds.clamp(5, MAX_SECONDS);
+            k.mods &= 0x7;
+            if k.vk > 0xFE {
+                k.vk = 0;
+            }
+        }
+        // A key belongs to one shortcut: the fixed actions and the main key win over extras.
+        let mut used: Vec<(u32, u32)> =
+            GlobalAction::ALL.iter().map(|a| self.hotkey(*a)).filter(|(vk, _)| *vk != 0).collect();
+        for k in &mut self.clip_keys {
+            if k.vk == 0 {
+                continue;
+            }
+            if used.contains(&(k.vk, k.mods)) {
+                k.vk = 0;
+                k.mods = 0;
+            } else {
+                used.push((k.vk, k.mods));
+            }
+        }
+    }
+
+    /// Longest configured clip duration: what the recorder keeps in memory.
+    pub fn buffer_seconds(&self) -> u32 {
+        // A row without a key cannot save, so it does not cost memory.
+        self.clip_keys.iter().filter(|k| k.vk != 0).map(|k| k.seconds).fold(self.seconds, u32::max)
     }
 
     /// Tecla (vk, mods) de un atajo global; vk 0 = sin asignar.
     pub fn hotkey(&self, a: GlobalAction) -> (u32, u32) {
-        match a {
-            GlobalAction::SaveClip => (self.hotkey_vk, self.hotkey_mods),
-            GlobalAction::ToggleRecording => (self.toggle_vk, self.toggle_mods),
-            GlobalAction::OpenEditor => (self.editor_vk, self.editor_mods),
-            GlobalAction::OpenFolder => (self.folder_vk, self.folder_mods),
+        self.hotkey_slot(HotkeySlot::Global(a))
+    }
+
+    /// Tecla (vk, mods) de cualquier atajo; vk 0 = sin asignar.
+    pub fn hotkey_slot(&self, slot: HotkeySlot) -> (u32, u32) {
+        match slot {
+            HotkeySlot::Global(a) => match a {
+                GlobalAction::SaveClip => (self.hotkey_vk, self.hotkey_mods),
+                GlobalAction::ToggleRecording => (self.toggle_vk, self.toggle_mods),
+                GlobalAction::OpenEditor => (self.editor_vk, self.editor_mods),
+                GlobalAction::OpenFolder => (self.folder_vk, self.folder_mods),
+            },
+            HotkeySlot::Clip(i) => self.clip_keys.get(i).map_or((0, 0), |k| (k.vk, k.mods)),
         }
+    }
+
+    /// All shortcuts with their key, for registering them and checking clashes.
+    pub fn hotkey_slots(&self) -> Vec<(HotkeySlot, u32, u32)> {
+        let globals = GlobalAction::ALL.into_iter().map(|a| {
+            let (vk, mods) = self.hotkey(a);
+            (HotkeySlot::Global(a), vk, mods)
+        });
+        let clips = self.clip_keys.iter().enumerate().map(|(i, k)| (HotkeySlot::Clip(i), k.vk, k.mods));
+        globals.chain(clips).collect()
     }
 
     /// RAM aproximada mientras graba (MB), como la muestra el Administrador de tareas: la app en sí
@@ -211,17 +297,26 @@ impl Config {
     /// (solo con mucho movimiento), así que se cuenta una décima parte: da un número realista, no el máximo.
     pub fn typical_ram_mb(&self) -> u32 {
         let channels = self.game_audio as u32 + self.desktop_audio as u32 + self.mic_audio as u32;
-        let audio = channels * self.seconds * 192 / 1000;
-        let video = self.bitrate_mbps * self.seconds / 80;
+        let keep = self.buffer_seconds();
+        let audio = channels * keep * 192 / 1000;
+        let video = self.bitrate_mbps * keep / 80;
         (40 + audio + video).div_ceil(10) * 10
     }
 
     pub fn hotkey_mut(&mut self, a: GlobalAction) -> (&mut u32, &mut u32) {
-        match a {
-            GlobalAction::SaveClip => (&mut self.hotkey_vk, &mut self.hotkey_mods),
-            GlobalAction::ToggleRecording => (&mut self.toggle_vk, &mut self.toggle_mods),
-            GlobalAction::OpenEditor => (&mut self.editor_vk, &mut self.editor_mods),
-            GlobalAction::OpenFolder => (&mut self.folder_vk, &mut self.folder_mods),
+        self.hotkey_slot_mut(HotkeySlot::Global(a))
+    }
+
+    pub fn hotkey_slot_mut(&mut self, slot: HotkeySlot) -> (&mut u32, &mut u32) {
+        match slot {
+            HotkeySlot::Global(GlobalAction::SaveClip) => (&mut self.hotkey_vk, &mut self.hotkey_mods),
+            HotkeySlot::Global(GlobalAction::ToggleRecording) => (&mut self.toggle_vk, &mut self.toggle_mods),
+            HotkeySlot::Global(GlobalAction::OpenEditor) => (&mut self.editor_vk, &mut self.editor_mods),
+            HotkeySlot::Global(GlobalAction::OpenFolder) => (&mut self.folder_vk, &mut self.folder_mods),
+            HotkeySlot::Clip(i) => {
+                let k = &mut self.clip_keys[i];
+                (&mut k.vk, &mut k.mods)
+            }
         }
     }
 }
