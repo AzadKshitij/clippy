@@ -14,7 +14,7 @@ use super::audio::{self, Audio, AudioBuf, Source};
 use super::capture::{Aim, Capture};
 use super::clock::{now_100ns, Timer};
 use super::convert::Converter;
-use super::encoder::{Encoder, Packet};
+use super::encoder::{Device, Encoder, Packet};
 use super::{game, mux};
 use crate::i18n::tr;
 use crate::config::{CaptureMode, Config};
@@ -32,7 +32,8 @@ pub enum Cmd {
 /// La bandeja solo usa algunos datos; los modos de prueba (`devtools`) los imprimen todos.
 #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
 pub enum Event {
-    Started(String),
+    /// Empezó a grabar, codificando con esto.
+    Started(Device),
     Saved(std::path::PathBuf),
     SaveFailed(String),
     Error(String),
@@ -81,18 +82,23 @@ enum End {
     Restart(HMONITOR),
 }
 
+/// Cada cuánto se vuelve a intentar grabar después de un error.
+const RETRY: Duration = Duration::from_secs(3);
+
 fn thread_main(mut cfg: Config, rx: Receiver<Cmd>, notify: Notify) {
     let _mf = Mf::init();
     unsafe {
         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     }
     let mut target = None;
+    // El último error avisado: mientras se repita en cada reintento, no se vuelve a anotar ni avisar.
+    let mut failing = None;
     // Una vez que el encoder rechazó un tamaño que no es múltiplo de 16, se graba siempre alineado.
     let mut align = false;
     loop {
         let monitor = target.take();
         let mut untested = None;
-        match session(&mut cfg, &rx, &notify, monitor, align, &mut untested) {
+        match session(&mut cfg, &rx, &notify, monitor, &mut failing, align, &mut untested) {
             Ok(End::Stop) => break,
             Ok(End::Restart(m)) => target = Some(m),
             // Quick Sync acepta el tamaño al configurarse y falla con el primer cuadro si no está alineado: Intel pide
@@ -106,10 +112,13 @@ fn thread_main(mut cfg: Config, rx: Receiver<Cmd>, notify: Notify) {
                 target = monitor;
             }
             Err(e) => {
-                log(&format!("error de captura: {e:?}"));
-                // Cada intento fallido avisa; la bandeja muestra el globo solo al pasar de grabar a error.
-                notify(Event::Error(e.to_string()));
-                match rx.recv_timeout(Duration::from_secs(3)) {
+                let msg = e.to_string();
+                if failing.as_ref() != Some(&msg) {
+                    log(&format!("error de captura: {e:?} (se reintenta cada {} s)", RETRY.as_secs()));
+                    notify(Event::Error(msg.clone()));
+                    failing = Some(msg);
+                }
+                match rx.recv_timeout(RETRY) {
                     Ok(Cmd::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                     Ok(Cmd::Update(c)) => cfg = c,
                     Ok(Cmd::Save) => notify(Event::SaveFailed(tr!("Clippy no está grabando en este momento", "Clippy isn't recording right now", "O Clippy não está gravando agora").into())),
@@ -232,12 +241,18 @@ fn align16((w, h): (u32, u32)) -> (u32, u32) {
 }
 
 /// `restarted`: el monitor del juego que pidió reiniciar (ya se grabó a su resolución; no se vuelve a pedir).
+/// `failing`: el error que se avisó; se olvida al volver a grabar.
 /// `align`: grabar a un tamaño múltiplo de 16. `untested`: el tamaño del video mientras el encoder todavía no
 /// entregó ningún cuadro (None hasta que se configura y otra vez cuando codifica).
-fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Option<HMONITOR>, align: bool, untested: &mut Option<(u32, u32)>) -> Result<End> {
-    let fps = cfg.fps.max(1);
-    let frame_dur = 10_000_000i64 / fps as i64;
-
+fn session(
+    cfg: &mut Config,
+    rx: &Receiver<Cmd>,
+    notify: &Notify,
+    restarted: Option<HMONITOR>,
+    failing: &mut Option<String>,
+    align: bool,
+    untested: &mut Option<(u32, u32)>,
+) -> Result<End> {
     let mut game = game::Detector::default();
     game.poll(0);
     // Qué monitor grabar: el del juego; si no hay juego, el de la ventana activa; si no, el principal.
@@ -246,14 +261,16 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
     if align {
         size = align16(size);
     }
-    let (w, h) = size;
     // Si ni se pudo configurar (no hay encoder, otra placa), no es por el tamaño: se avisa como siempre.
-    let mut enc = Encoder::new(&cap.device, cap.luid, w, h, fps, cfg.bitrate_mbps * 1_000_000)?;
-    *untested = Some(size);
+    let mut enc = Encoder::new(&cap.device, cap.luid, size.0, size.1, cfg.fps.max(1), cfg.bitrate_mbps * 1_000_000)?;
+    // El encoder por procesador puede pedir menos que lo elegido.
+    let (w, h, fps) = (enc.width, enc.height, enc.fps);
+    let frame_dur = 10_000_000i64 / fps as i64;
+    *untested = Some((w, h));
     // Prueba (CLIPPY_TEST_ALIGN16): un encoder que, como Quick Sync, falla en el primer cuadro si el tamaño no
     // es múltiplo de 16.
     #[cfg(feature = "devtools")]
-    let reject = std::env::var_os("CLIPPY_TEST_ALIGN16").is_some() && align16(size) != size;
+    let reject = std::env::var_os("CLIPPY_TEST_ALIGN16").is_some() && align16((w, h)) != (w, h);
     log(&format!(
         "grabando {} a {w}x{h} @ {fps} fps, H.264 {} Mbps, buffer {} s (máximo en esta PC: {} s), encoder: {}",
         cap.describe(),
@@ -262,7 +279,8 @@ fn session(cfg: &mut Config, rx: &Receiver<Cmd>, notify: &Notify, restarted: Opt
         cfg.max_seconds(),
         enc.name
     ));
-    notify(Event::Started(enc.name.clone()));
+    *failing = None;
+    notify(Event::Started(enc.device()));
 
     let mut conv: Option<Converter> = None;
     let timer = Timer::new();
