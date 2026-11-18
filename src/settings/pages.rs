@@ -8,7 +8,7 @@ use crate::app::autostart;
 use crate::app::keys::hotkey_name;
 use crate::app::mode::Mode;
 use crate::app::update;
-use crate::config::{CaptureMode, GlobalAction, MAX_MBPS, MAX_SECONDS, MIN_MBPS, RESOLUTIONS};
+use crate::config::{CaptureMode, GlobalAction, MAX_MBPS, MAX_SECONDS, MIN_MBPS, MIN_SECONDS, RESOLUTIONS};
 use crate::i18n::{tr, trf, Lang, Language};
 
 /// Calidades de video de un toque (Mbps): baja, media y alta.
@@ -265,24 +265,30 @@ impl SettingsApp {
 
     fn recording_section(&mut self, ui: &mut egui::Ui) {
         section(ui, tr!("Grabación", "Recording", "Gravação"), |ui| {
+            let max = self.cfg.max_seconds();
             row(ui, tr!("Duración del clip", "Clip length", "Duração do clipe"), LABEL_W, |ui| {
                 ui.spacing_mut().slider_width = (ui.available_width() - 104.0).max(80.0);
                 ui.add(
-                    egui::Slider::new(&mut self.cfg.seconds, 5..=MAX_SECONDS)
+                    egui::Slider::new(&mut self.cfg.seconds, MIN_SECONDS..=max)
                         .step_by(5.0)
                         .custom_formatter(|v, _| fmt_secs(v as u32)),
                 );
             });
             let secs = fmt_secs(self.cfg.seconds);
-            hint(
-                ui,
-                LABEL_W + 8.0,
-                trf!(
-                    "Guarda los últimos {secs} antes de apretar la tecla.",
-                    "Saves the last {secs} before you press the key.",
-                    "Salva os últimos {secs} antes de você apertar a tecla."
-                ),
+            let mut why = trf!(
+                "Guarda los últimos {secs} antes de apretar la tecla.",
+                "Saves the last {secs} before you press the key.",
+                "Salva os últimos {secs} antes de você apertar a tecla."
             );
+            if max < MAX_SECONDS {
+                let max = fmt_secs(max);
+                why += &trf!(
+                    " Con esta calidad y la RAM de tu PC, llega hasta {max}.",
+                    " With this quality and your PC's RAM, it goes up to {max}.",
+                    " Com esta qualidade e a RAM do seu PC, vai até {max}."
+                );
+            }
+            hint(ui, LABEL_W + 8.0, why);
             divider(ui);
             row(ui, tr!("Calidad", "Quality", "Qualidade"), LABEL_W, |ui| {
                 // 0 = "Personalizada": se elige el bitrate a mano.
@@ -315,6 +321,8 @@ impl SettingsApp {
                     ),
                 );
             }
+            // Más calidad, menos segundos entran en la RAM: se recorta en el mismo cuadro.
+            self.cfg.seconds = self.cfg.seconds.min(self.cfg.max_seconds());
             row(ui, tr!("Resolución", "Resolution", "Resolução"), LABEL_W, |ui| {
                 let native = tr!("Como el monitor", "Same as monitor", "Igual ao monitor");
                 let labels = RESOLUTIONS.map(|r| if r == 0 { native.to_string() } else { format!("{r}p") });
@@ -369,8 +377,8 @@ impl SettingsApp {
             );
             divider(ui);
             row(ui, tr!("Memoria", "Memory", "Memória"), LABEL_W, |ui| {
-                let mb = self.cfg.typical_ram_mb();
-                let txt = trf!("Unos {mb} MB de RAM mientras graba", "About {mb} MB of RAM while recording", "Cerca de {mb} MB de RAM enquanto grava");
+                let ram = fmt_bytes(self.cfg.typical_ram_mb() as f64 * 1e6);
+                let txt = trf!("Unos {ram} de RAM mientras graba", "About {ram} of RAM while recording", "Cerca de {ram} de RAM enquanto grava");
                 ui.label(RichText::new(txt).family(bold()).color(TEXT));
             });
             hint(
