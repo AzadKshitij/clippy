@@ -1,6 +1,7 @@
 //! Modos de prueba sin ventana (solo con `--features devtools`; no van en el exe publicado).
 //!
-//! - `--test <segundos> <carpeta> [game|desktop|mic|juegos]`: graba, guarda un clip y sale.
+//! - `--test <segundos> <carpeta> [game|desktop|mic|juegos|resolución]`: graba, guarda un clip y sale. Con
+//!   `CLIPPY_TEST_ALIGN16=1`, el encoder falla con tamaños que no son múltiplo de 16 (`--test 8 <carpeta> 766`).
 //! - `--test-mic`: cuánto audio entrega cada micrófono en 3 s.
 //! - `--test-download`: descarga la versión publicada como el botón "Actualizar".
 //! - `--test-export`, `--test-frame`, `--test-strip`, `--test-covers`: ver `editor::devtools`.
@@ -110,7 +111,7 @@ fn test_mode(args: &[String]) -> i32 {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(crate::record::recorder::Event::Started(n)) => println!("encoder: {n}"),
+            Ok(crate::record::recorder::Event::Started(d)) => println!("encoder: {d:?}"),
             Ok(crate::record::recorder::Event::Game(g)) => println!("juego: {}", g.as_deref().unwrap_or("ninguno")),
             Ok(crate::record::recorder::Event::Saved(p)) => {
                 println!("OK {}", p.display());

@@ -3,10 +3,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::i18n::{self, tr, Language};
 use crate::log::app_dir;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::UI::Shell::{FOLDERID_Videos, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
 /// Qué imagen se graba. En config.json se guarda como "pantalla" / "juegos".
@@ -39,9 +41,15 @@ impl From<CaptureMode> for &'static str {
     }
 }
 
-pub const MAX_SECONDS: u32 = 300;
+/// Duración del clip que se puede elegir. El máximo real de cada PC sale de su RAM (`max_seconds`).
+pub const MIN_SECONDS: u32 = 5;
+pub const MAX_SECONDS: u32 = 600;
 /// Extra shortcuts (one clip duration each) that can be configured.
 pub const MAX_CLIP_KEYS: usize = 4;
+/// Parte de la RAM total que puede ocupar el buffer en el peor caso (1/4).
+const RAM_SHARE: u64 = 4;
+/// Audio en crudo de cada canal en el buffer (bytes por segundo).
+const AUDIO_BYTES_PER_SEC: u64 = 192_000;
 /// Calidad de video (Mbps) que se puede elegir a mano en "Personalizada".
 pub const MIN_MBPS: u32 = 5;
 pub const MAX_MBPS: u32 = 150;
@@ -93,6 +101,8 @@ pub struct Config {
     /// Extra shortcuts, each saving its own duration. The buffer holds the longest of them.
     #[serde(default)]
     pub clip_keys: Vec<ClipKey>,
+    /// Idioma de la interfaz ("auto" = el de Windows).
+    pub language: Language,
 }
 
 /// Atajos globales: funcionan en cualquier momento, incluso dentro del juego.
@@ -119,10 +129,10 @@ impl GlobalAction {
 
     pub fn label(self) -> &'static str {
         match self {
-            GlobalAction::SaveClip => "Guardar clip",
-            GlobalAction::ToggleRecording => "Pausar / reanudar grabación",
-            GlobalAction::OpenEditor => "Abrir el editor",
-            GlobalAction::OpenFolder => "Abrir la carpeta de clips",
+            GlobalAction::SaveClip => tr!("Guardar clip", "Save clip", "Salvar clipe"),
+            GlobalAction::ToggleRecording => tr!("Pausar / reanudar grabación", "Pause / resume recording", "Pausar / retomar gravação"),
+            GlobalAction::OpenEditor => tr!("Abrir el editor", "Open the editor", "Abrir o editor"),
+            GlobalAction::OpenFolder => tr!("Abrir la carpeta de clips", "Open the clips folder", "Abrir a pasta de clipes"),
         }
     }
 }
@@ -180,8 +190,19 @@ impl Default for Config {
             folder_vk: 0,
             folder_mods: 0,
             clip_keys: Vec::new(),
+            language: Language::Auto,
         }
     }
+}
+
+/// `full` achicado sin deformar (en pares) para que el lado corto no pase de `short`.
+pub fn fit_short(full: (u32, u32), short: u32) -> (u32, u32) {
+    let s = full.0.min(full.1);
+    if short >= s {
+        return full;
+    }
+    let k = |x: u32| ((x as u64 * short as u64 / s as u64) as u32).max(2) & !1;
+    (k(full.0), k(full.1))
 }
 
 impl Config {
@@ -192,12 +213,10 @@ impl Config {
 
     /// Tamaño del video (pares) para un monitor que se grabaría a `full`, con la resolución elegida.
     pub fn video_size(&self, full: (u32, u32)) -> (u32, u32) {
-        let short = full.0.min(full.1);
-        if self.resolution == 0 || self.resolution >= short {
-            return full;
+        match self.resolution {
+            0 => full,
+            r => fit_short(full, r),
         }
-        let k = |x: u32| ((x as u64 * self.resolution as u64 / short as u64) as u32).max(2) & !1;
-        (k(full.0), k(full.1))
     }
 
     pub fn audio_on(&self) -> bool {
@@ -205,11 +224,11 @@ impl Config {
     }
 
     pub fn sanitize(&mut self) {
-        self.seconds = self.seconds.clamp(5, MAX_SECONDS);
         if !matches!(self.fps, 30 | 60 | 120) {
             self.fps = 60;
         }
         self.bitrate_mbps = self.bitrate_mbps.clamp(MIN_MBPS, MAX_MBPS);
+        self.seconds = self.seconds.clamp(MIN_SECONDS, self.max_seconds());
         if !RESOLUTIONS.contains(&self.resolution) {
             self.resolution = 0;
         }
@@ -235,8 +254,9 @@ impl Config {
             }
         }
         self.clip_keys.truncate(MAX_CLIP_KEYS);
+        let cap = self.max_seconds();
         for k in &mut self.clip_keys {
-            k.seconds = k.seconds.clamp(5, MAX_SECONDS);
+            k.seconds = k.seconds.clamp(MIN_SECONDS, cap);
             k.mods &= 0x7;
             if k.vk > 0xFE {
                 k.vk = 0;
@@ -298,9 +318,18 @@ impl Config {
     pub fn typical_ram_mb(&self) -> u32 {
         let channels = self.game_audio as u32 + self.desktop_audio as u32 + self.mic_audio as u32;
         let keep = self.buffer_seconds();
-        let audio = channels * keep * 192 / 1000;
+        let audio = channels * keep * (AUDIO_BYTES_PER_SEC / 1000) as u32 / 1000;
         let video = self.bitrate_mbps * keep / 80;
         (40 + audio + video).div_ceil(10) * 10
+    }
+
+    /// Duración máxima del clip en esta PC con la calidad elegida (múltiplo de 5 s): aunque el video
+    /// llegue al bitrate completo (todo en movimiento), el buffer no pasa de un cuarto de la RAM.
+    pub fn max_seconds(&self) -> u32 {
+        // Se cuentan los tres canales de audio: así prender el micrófono no recorta la duración.
+        let per_sec = self.bitrate_mbps as u64 * 125_000 + 3 * AUDIO_BYTES_PER_SEC;
+        let secs = (total_ram() / RAM_SHARE / per_sec).min(MAX_SECONDS as u64) as u32;
+        (secs / 5 * 5).max(MIN_SECONDS)
     }
 
     pub fn hotkey_mut(&mut self, a: GlobalAction) -> (&mut u32, &mut u32) {
@@ -321,6 +350,18 @@ impl Config {
     }
 }
 
+/// RAM física total (bytes). Si Windows no contesta, se asume una PC de 8 GB.
+fn total_ram() -> u64 {
+    static RAM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RAM.get_or_init(|| {
+        let mut m = MEMORYSTATUSEX { dwLength: size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
+        match unsafe { GlobalMemoryStatusEx(&mut m) } {
+            Ok(()) if m.ullTotalPhys > 0 => m.ullTotalPhys,
+            _ => 8 << 30,
+        }
+    })
+}
+
 pub fn config_path() -> PathBuf {
     app_dir().join("config.json")
 }
@@ -329,12 +370,14 @@ pub fn exists() -> bool {
     config_path().exists()
 }
 
+/// Lee config.json y aplica su idioma a este proceso (así cada ventana y la bandeja lo siguen al recargar).
 pub fn load() -> Config {
     let mut cfg: Config = std::fs::read_to_string(config_path())
         .ok()
         .and_then(|s| serde_json::from_str(s.trim_start_matches('\u{feff}')).ok())
         .unwrap_or_default();
     cfg.sanitize();
+    i18n::set(cfg.language);
     cfg
 }
 

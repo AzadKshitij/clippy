@@ -5,13 +5,49 @@ Ver `README.md` para el mapa del código y los modos del exe.
 
 ## Reglas
 
-- **Liviano ante todo.** El exe no puede crecer sin una razón fuerte: medí `target/release/clippy.exe`
-  antes y después de cada cambio. No sumes dependencias si Windows ya trae la API.
+- No sumes dependencias si Windows ya trae la API.
 - **Que se comporte como una app de verdad** (Medal, NVIDIA Instant Replay): nada hardcodeado
   para un juego, nada que el usuario tenga que configurar si se puede detectar.
-- **Textos de la interfaz en español rioplatense** ("vos", "tocá", "apretá"). Comentarios en español.
-- **Commits y PRs sin atribución de IA**: nada de `Co-Authored-By`, "Generated with" ni links de sesión.
+- **Textos de la interfaz en tres idiomas**: español rioplatense ("vos", "tocá", "apretá"), inglés y
+  portugués de Brasil. Cada texto va donde se usa con `tr!(es, en, pt)` o, con valores, `trf!` (ver
+  `src/i18n.rs`); nunca un literal suelto en la interfaz. Los errores que llegan a la pantalla se traducen
+  donde se crean (`bail!(tr!(…))`), así que en `clippy.log` quedan en el idioma de la interfaz; el resto del
+  registro y los comentarios, en español.
 - No publicar releases sin que el usuario lo pida.
+
+## Flujo de trabajo
+
+Todo cambio entra a `main` por PR; nunca se commitea directo en `main`.
+
+- **Primero el issue, después la PR.** Cada PR cierra su issue con `Closes #N`; si no existe, abrilo antes de
+  crear la rama (ver "Issues y PRs"). Solo las `chore/` de versión o CI van sin issue.
+- **Cada cosa nueva arranca de `main` al día y en un worktree propio**, nunca en el checkout principal:
+
+  ```bash
+  git switch main && git pull --ff-only
+  git worktree add .claude/worktrees/<nombre> -b <tipo>/<nombre> main
+  ```
+
+  Si el checkout principal está en otra rama o tiene cambios sin commitear, no lo toques: `git fetch origin`
+  y creá el worktree desde `origin/main`.
+- **Ramas `<tipo>/<nombre>`**: `feature/` (algo nuevo), `fix/` (un bug), `chore/` (versiones, CI,
+  dependencias, limpieza) o `docs/` (solo documentación). `<nombre>` corto, en español y en kebab-case, dice
+  qué cambia (`feature/cursor-en-escritorio`, `fix/encoder-1366`); el worktree se llama igual.
+- Una rama por cambio y PRs chicos. El primer `cargo build` en un worktree nuevo compila todo de cero.
+- Cuando la PR se mergea, borrá el worktree: `git worktree remove .claude/worktrees/<nombre>`.
+- **Commits y PRs sin atribución de IA**: nada de `Co-Authored-By`, "Generated with" ni links de sesión.
+
+## Issues y PRs
+
+Todas siguen las plantillas de `.github/`, ya sea que las abra una persona en GitHub o un agente con `gh`.
+Con `gh`, armá el cuerpo con las mismas secciones que la plantilla.
+
+- **Issues**: `.github/ISSUE_TEMPLATE/bug.md` (algo no anda) y `mejora.md` (algo nuevo o distinto). El título
+  dice el síntoma o el resultado, con el dato que lo identifica: "El encoder falla con resoluciones que no son
+  múltiplo de 16 (1366×768, 0x80004005)".
+- **PRs**: `.github/pull_request_template.md`. El título, en español y sin prefijos tipo `feat:`, dice el
+  comportamiento nuevo: "Duración máxima de clips según la RAM, hasta 10 min".
+- Bullets cortos, sin repetir el diff y sin secciones vacías: la opcional que no aplica se borra.
 
 ## Dónde va cada cosa
 
@@ -22,7 +58,8 @@ Ver `README.md` para el mapa del código y los modos del exe.
 - Buffer de la grabadora: `config::buffer_seconds()` (la duración más larga entre `seconds` y
   `clip_keys` con tecla). Guardar nunca pide más que eso, así que una duración corta usa el mismo buffer.
 - Qué cuenta como juego: solo `src/record/game.rs` (lo usan el modo "Solo juegos" y el canal de audio).
-- `config.json` lo escriben la ventana de ajustes y la bandeja; `editor.json` solo el editor.
+- `config.json` lo escriben la ventana de ajustes y la bandeja; `editor.json` solo el editor;
+  `recorder.json` (con qué graba y por qué no puede, `app/status.rs`) solo la bandeja.
 - Código que solo sirve para probar va detrás de `#[cfg(feature = "devtools")]`.
 
 ## Interfaz y movimiento
@@ -61,7 +98,6 @@ y nada de código muerto.
 cargo clippy --features devtools -- -D warnings   # chequeo rápido, el mismo que corre el CI
 cargo build --profile fast --features devtools    # para probar: unos segundos por cambio
 target/fast/clippy.exe --test 8 <carpeta> game
-cargo build --release                             # una sola vez, al final, para medir el tamaño
 ```
 
 Compilá siempre en `target/` con estos perfiles: otra `--target-dir` recompila todo de cero.

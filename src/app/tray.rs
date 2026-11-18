@@ -16,9 +16,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::autostart;
 use super::keys::hotkey_name;
+use super::status::{self, Status};
 use super::mode::{Mode, Window, TRAY_CLASS, TRAY_MUTEX, WM_HOTKEY_SUSPEND, WM_REC_EVENT, WM_RELOAD, WM_TRAY, WM_UPDATE};
 use super::update;
 use crate::config::{self, Config, GlobalAction, HotkeySlot, MAX_CLIP_KEYS};
+use crate::i18n::{tr, trf};
 use crate::log::log;
 use crate::record::recorder::{Event, Notify, Recorder};
 use crate::ui_kit::{icon, sound, theme::fmt_secs, window::open_folder};
@@ -46,7 +48,8 @@ struct App {
     rec: Option<Recorder>,
     icon_on: HICON,
     icon_off: HICON,
-    error: Option<String>,
+    /// Con qué graba y por qué no puede (lo muestra también la ventana principal).
+    status: Status,
     /// Juego detectado por la grabadora (para el tooltip).
     game: Option<String>,
 }
@@ -99,19 +102,25 @@ pub fn run(background: bool) {
             rec: None,
             icon_on: icon::hicon(size, true),
             icon_off: icon::hicon(size, false),
-            error: None,
+            status: Status::default(),
             game: None,
         };
         app.tray(NIM_ADD);
+        status::save(&app.status);
         APP.with(|a| *a.borrow_mut() = Some(app));
         with_app(|a| a.apply(cfg.clone(), true));
         log("Clippy iniciado");
         if first_run {
             let key = hotkey_name(cfg.hotkey_vk, cfg.hotkey_mods);
             with_app(|a| {
+                let secs = fmt_secs(cfg.seconds);
                 a.balloon(
-                    "Clippy está grabando",
-                    &format!("Apretá {key} para guardar los últimos {}. Clippy queda acá, en la bandeja.", fmt_secs(cfg.seconds)),
+                    tr!("Clippy está grabando", "Clippy is recording", "O Clippy está gravando"),
+                    &trf!(
+                        "Apretá {key} para guardar los últimos {secs}. Clippy queda acá, en la bandeja.",
+                        "Press {key} to save the last {secs}. Clippy stays here, in the tray.",
+                        "Aperte {key} para salvar os últimos {secs}. O Clippy fica aqui, na bandeja."
+                    ),
                     false,
                 )
             });
@@ -159,7 +168,7 @@ impl App {
         self.cfg = new;
         if restart || (self.cfg.enabled && self.rec.is_none()) {
             self.rec = None; // detiene la grabadora anterior
-            self.error = None;
+            self.set_status(Status::default());
             self.game = None;
             if self.cfg.enabled {
                 self.rec = Some(Recorder::start(self.cfg.clone(), notifier(self.hwnd)));
@@ -172,7 +181,15 @@ impl App {
             let failed = self.register_hotkeys();
             if !failed.is_empty() {
                 let k = failed.join(", ");
-                self.balloon("Tecla ocupada", &format!("Otro programa está usando {k}. Elegí otra en Ajustes."), true);
+                self.balloon(
+                    tr!("Tecla ocupada", "Key in use", "Tecla em uso"),
+                    &trf!(
+                        "Otro programa está usando {k}. Elegí otra en Ajustes.",
+                        "Another program is using {k}. Pick another one in Settings.",
+                        "Outro programa está usando {k}. Escolha outra nas Configurações."
+                    ),
+                    true,
+                );
             }
         }
         self.tray(NIM_MODIFY);
@@ -209,21 +226,18 @@ impl App {
     }
 
     fn tip(&self) -> String {
-        if let Some(e) = &self.error {
-            return format!("Clippy · error: {e}");
+        if let Some(e) = &self.status.error {
+            return trf!("Clippy · error: {e}", "Clippy · error: {e}", "Clippy · erro: {e}");
         }
         if self.cfg.enabled {
-            let mut t = format!(
-                "Clippy · grabando · {} guarda {}",
-                hotkey_name(self.cfg.hotkey_vk, self.cfg.hotkey_mods),
-                fmt_secs(self.cfg.seconds)
-            );
+            let (key, secs) = (hotkey_name(self.cfg.hotkey_vk, self.cfg.hotkey_mods), fmt_secs(self.cfg.seconds));
+            let mut t = trf!("Clippy · grabando · {key} guarda {secs}", "Clippy · recording · {key} saves {secs}", "Clippy · gravando · {key} salva {secs}");
             if let Some(g) = &self.game {
-                t.push_str(&format!(" · juego: {g}"));
+                t.push_str(&trf!(" · juego: {g}", " · game: {g}", " · jogo: {g}"));
             }
             t
         } else {
-            "Clippy · pausado".into()
+            tr!("Clippy · pausado", "Clippy · paused", "Clippy · pausado").into()
         }
     }
 
@@ -240,7 +254,7 @@ impl App {
         let mut n = self.nid();
         n.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         n.uCallbackMessage = WM_TRAY;
-        n.hIcon = if self.cfg.enabled && self.error.is_none() { self.icon_on } else { self.icon_off };
+        n.hIcon = if self.cfg.enabled && self.status.error.is_none() { self.icon_on } else { self.icon_off };
         set_wstr(&mut n.szTip, &self.tip());
         unsafe {
             let _ = Shell_NotifyIconW(op, &n);
@@ -271,10 +285,18 @@ impl App {
         self.apply(c, false);
     }
 
+    /// Cambia el estado y, si es otro, lo deja escrito para la ventana principal.
+    fn set_status(&mut self, s: Status) {
+        if s != self.status {
+            self.status = s;
+            status::save(&self.status);
+        }
+    }
+
     fn handle_event(&mut self, ev: Event) {
         match ev {
-            Event::Started(_) => {
-                self.error = None;
+            Event::Started(d) => {
+                self.set_status(Status { device: Some(d), error: None });
                 self.tray(NIM_MODIFY);
             }
             Event::Game(g) => {
@@ -282,14 +304,18 @@ impl App {
                 self.tray(NIM_MODIFY);
             }
             Event::Saved(_) => {} // el sonido lo reproduce la grabadora al instante
-            Event::SaveFailed(e) => self.balloon("No se pudo guardar el clip", &e, true),
+            Event::SaveFailed(e) => self.balloon(tr!("No se pudo guardar el clip", "Couldn't save the clip", "Não foi possível salvar o clipe"), &e, true),
             Event::Error(e) => {
-                // La grabadora avisa en cada reintento: el globo sale solo al pasar de grabar a error.
-                let new = self.error.is_none();
-                self.error = Some(e.clone());
+                // El globo sale al pasar de grabar a error, no si cambia el motivo mientras se reintenta.
+                let new = self.status.error.is_none();
+                self.set_status(Status { device: None, error: Some(e.clone()) });
                 self.tray(NIM_MODIFY);
                 if new {
-                    self.balloon("Clippy no puede grabar", &format!("{e}\nSe reintenta solo."), true);
+                    self.balloon(
+                        tr!("Clippy no puede grabar", "Clippy can't record", "O Clippy não consegue gravar"),
+                        &trf!("{e}\nSe reintenta solo.", "{e}\nIt retries by itself.", "{e}\nEle tenta de novo sozinho."),
+                        true,
+                    );
                 }
             }
         }
@@ -329,20 +355,21 @@ fn show_menu(hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         // El editor va primero y en negrita: es lo que más se usa después de grabar.
-        let _ = AppendMenuW(menu, MF_STRING, ID_EDITOR, w!("Abrir editor de clips"));
+        let item = |s: &str| HSTRING::from(s);
+        let _ = AppendMenuW(menu, MF_STRING, ID_EDITOR, &item(tr!("Abrir editor de clips", "Open clip editor", "Abrir editor de clipes")));
         let _ = SetMenuDefaultItem(menu, ID_EDITOR as u32, 0);
-        let save_label = HSTRING::from(format!("Guardar clip ahora\t{key}"));
+        let save_label = HSTRING::from(trf!("Guardar clip ahora\t{key}", "Save clip now\t{key}", "Salvar clipe agora\t{key}"));
         let save_flags = if enabled { MF_STRING } else { MF_STRING | MF_GRAYED };
         let _ = AppendMenuW(menu, save_flags, ID_SAVE, &save_label);
-        let _ = AppendMenuW(menu, MF_STRING, ID_FOLDER, w!("Abrir carpeta de clips"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_FOLDER, &item(tr!("Abrir carpeta de clips", "Open clips folder", "Abrir pasta de clipes")));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let check = if enabled { MF_CHECKED } else { MF_UNCHECKED };
-        let _ = AppendMenuW(menu, MF_STRING | check, ID_TOGGLE, w!("Grabando"));
+        let _ = AppendMenuW(menu, MF_STRING | check, ID_TOGGLE, &item(tr!("Grabando", "Recording", "Gravando")));
         let mic = with_app(|a| a.cfg.mic_audio).unwrap_or(false);
-        let _ = AppendMenuW(menu, MF_STRING | if mic { MF_CHECKED } else { MF_UNCHECKED }, ID_MIC, w!("Micrófono"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Abrir Clippy"));
+        let _ = AppendMenuW(menu, MF_STRING | if mic { MF_CHECKED } else { MF_UNCHECKED }, ID_MIC, &item(tr!("Micrófono", "Microphone", "Microfone")));
+        let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, &item(tr!("Abrir Clippy", "Open Clippy", "Abrir Clippy")));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Salir"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, &item(tr!("Salir", "Quit", "Sair")));
 
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
@@ -427,7 +454,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_UPDATE => {
             if let Some((v, _)) = update::available() {
-                with_app(|a| a.balloon("Hay una versión nueva de Clippy", &format!("La versión {v} está lista. Tocá acá para actualizar."), false));
+                with_app(|a| {
+                    a.balloon(
+                        tr!("Hay una versión nueva de Clippy", "A new version of Clippy is out", "Há uma nova versão do Clippy"),
+                        &trf!(
+                            "La versión {v} está lista. Tocá acá para actualizar.",
+                            "Version {v} is ready. Click here to update.",
+                            "A versão {v} está pronta. Clique aqui para atualizar."
+                        ),
+                        false,
+                    )
+                });
             }
             LRESULT(0)
         }
